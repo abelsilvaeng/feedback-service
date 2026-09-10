@@ -1,5 +1,8 @@
 package com.retailstore.feedback.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import com.retailstore.feedback.model.FeedbackEntry;
 import com.retailstore.feedback.model.EnhancedFeedback;
 import com.retailstore.feedback.model.FeedbackSummary;
@@ -40,6 +43,12 @@ public class FeedbackService {
             Pattern.compile("\"category\"\\s*:\\s*\"([^\"]+)\"");
     private static final Pattern INSIGHT_PATTERN =
             Pattern.compile("\"actionableInsight\"\\s*:\\s*\"([^\"]+)\"");
+
+    // How many entries go to Gemini in one call, and the room its answer needs
+    private static final int BATCH_SIZE = 10;
+    private static final int MAX_BATCH_TOKENS = 8192;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     // Cache for feedback data
     private List<EnhancedFeedback> enhancedFeedbackCache = null;
@@ -159,19 +168,99 @@ public class FeedbackService {
         List<FeedbackEntry> entries = readFeedbackData();
         List<EnhancedFeedback> enhancedEntries = new ArrayList<>();
 
-        int done = 0;
-        for (FeedbackEntry entry : entries) {
-            enhancedEntries.add(enhanceFeedback(entry));
-            done++;
-            if (done % 10 == 0) {
-                System.out.println("Enhanced " + done + " of " + entries.size() + " entries");
-            }
+        // Entries go to Gemini in batches rather than one call each. Fifty separate calls
+        // exhaust the free tier quota, which is measured per minute, and every throttled entry
+        // silently degrades to "Uncategorized" on the dashboard.
+        for (int start = 0; start < entries.size(); start += BATCH_SIZE) {
+            List<FeedbackEntry> batch = entries.subList(start, Math.min(start + BATCH_SIZE, entries.size()));
+            enhancedEntries.addAll(enhanceBatch(batch));
+            System.out.println("Enhanced " + enhancedEntries.size() + " of " + entries.size() + " entries");
         }
 
         // Cache the enhanced feedback
         enhancedFeedbackCache = enhancedEntries;
 
         return enhancedEntries;
+    }
+
+    /**
+     * Categorises a batch of entries in a single Gemini call.
+     *
+     * <p>Any entry the model leaves out of its answer falls back to its own call, so a partial
+     * or malformed batch response costs accuracy on a few entries rather than all of them.
+     *
+     * @param batch Entries to categorise together
+     * @return The same entries, enhanced
+     */
+    private List<EnhancedFeedback> enhanceBatch(List<FeedbackEntry> batch) {
+        StringBuilder items = new StringBuilder();
+        for (FeedbackEntry entry : batch) {
+            items.append("- id: ").append(entry.getId())
+                    .append(" | department: ").append(entry.getDepartment())
+                    .append(" | sentiment: ").append(entry.getSentiment())
+                    .append(" | comment: ").append(entry.getComment())
+                    .append("\n");
+        }
+
+        String prompt = String.format("""
+            You are an AI assistant specialized in customer feedback analysis.
+            For EACH feedback below:
+            1. Categorize it into exactly one of these categories: Product Quality, Customer Service, Store Experience, Website/App, Delivery, Price/Value, Inventory/Stock, or Other.
+            2. Write one specific actionable insight or recommendation.
+
+            Return a JSON array. One object per feedback, with the fields "id" (the number given),
+            "category" and "actionableInsight". Return every id, in the order given, and nothing else.
+            Keep each insight to one sentence.
+
+            Customer feedback:
+            %s
+            """, items);
+
+        Map<Integer, JsonNode> byId = new HashMap<>();
+        try {
+            String response = geminiService.generateContent(prompt, MAX_BATCH_TOKENS);
+            JsonNode root = objectMapper.readTree(response);
+
+            // The model may return the array bare or wrapped in an object under some key.
+            JsonNode array = root.isArray() ? root : firstArrayIn(root);
+            if (array != null) {
+                for (JsonNode node : array) {
+                    if (node.hasNonNull("id")) {
+                        byId.put(node.get("id").asInt(), node);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Batch enhancement failed, falling back to one call per entry: " + e.getMessage());
+        }
+
+        List<EnhancedFeedback> result = new ArrayList<>();
+        for (FeedbackEntry entry : batch) {
+            JsonNode node = byId.get(entry.getId());
+            if (node == null) {
+                // Not in the batch answer, ask for this one on its own.
+                result.add(enhanceFeedback(entry));
+                continue;
+            }
+
+            EnhancedFeedback enhanced = new EnhancedFeedback(entry);
+            enhanced.setCategory(node.path("category").asText("Uncategorized"));
+            enhanced.setActionableInsight(
+                    node.path("actionableInsight").asText("No specific action recommended."));
+            result.add(enhanced);
+        }
+
+        return result;
+    }
+
+    /** Finds the first array value in an object, for when the model wraps its answer. */
+    private JsonNode firstArrayIn(JsonNode root) {
+        for (JsonNode child : root) {
+            if (child.isArray()) {
+                return child;
+            }
+        }
+        return null;
     }
 
     /**

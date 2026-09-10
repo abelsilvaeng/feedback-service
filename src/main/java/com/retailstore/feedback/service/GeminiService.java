@@ -37,11 +37,23 @@ public class GeminiService {
      * @return The response from Gemini
      */
     public String generateContent(String prompt) {
+        return generateContent(prompt, 1024);
+    }
+
+    /**
+     * Same, with room for a larger answer. A batch of feedback entries needs more than the
+     * single-entry default.
+     *
+     * @param prompt           The prompt to send to Gemini
+     * @param maxOutputTokens  Ceiling on the generated answer
+     * @return The response from Gemini
+     */
+    public String generateContent(String prompt, int maxOutputTokens) {
         long backoff = INITIAL_BACKOFF_MS;
 
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
-                return callGemini(prompt);
+                return callGemini(prompt, maxOutputTokens);
             } catch (HttpClientErrorException.TooManyRequests e) {
                 // Free tier requests per minute exceeded. Wait and retry rather than losing the entry.
                 if (attempt == MAX_ATTEMPTS) {
@@ -70,7 +82,7 @@ public class GeminiService {
      * One call to generateContent. The API key travels in the x-goog-api-key header rather than
      * as a query parameter, so it does not end up in access logs or proxy history.
      */
-    private String callGemini(String prompt) throws Exception {
+    private String callGemini(String prompt, int maxOutputTokens) throws Exception {
         // Create the request body using Jackson
         ObjectNode requestBody = objectMapper.createObjectNode();
         ArrayNode contents = objectMapper.createArrayNode();
@@ -87,8 +99,13 @@ public class GeminiService {
         // Add generation config for better JSON responses
         ObjectNode generationConfig = objectMapper.createObjectNode();
         generationConfig.put("temperature", 0.7);
-        generationConfig.put("maxOutputTokens", 1024);
+        generationConfig.put("maxOutputTokens", maxOutputTokens);
         generationConfig.put("responseMimeType", "application/json");
+        // Gemini 3.x reasons before answering by default, which roughly triples latency on a
+        // task this mechanical. Categorising one sentence does not need it.
+        ObjectNode thinkingConfig = objectMapper.createObjectNode();
+        thinkingConfig.put("thinkingLevel", "low");
+        generationConfig.set("thinkingConfig", thinkingConfig);
         requestBody.set("generationConfig", generationConfig);
 
         // Set headers

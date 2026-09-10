@@ -27,9 +27,13 @@ java -jar target/feedback-service-0.0.1-SNAPSHOT.jar
 
 Then open <http://localhost:8080>.
 
-The first page load makes one Gemini call per feedback entry, fifty in total, and blocks until
-they finish. Expect a minute or two. After that the results are cached in memory for the life
-of the process, so subsequent loads are instant. Restarting the app clears the cache.
+The first page load sends the fifty entries to Gemini in five batches of ten and blocks until
+they finish, which takes about twenty seconds. After that the results are cached in memory for
+the life of the process, so subsequent loads are instant. Restarting the app clears the cache.
+
+![Dashboard charts](docs/dashboard-top.jpg)
+
+![Feedback tables](docs/dashboard-tables.jpg)
 
 ## Endpoints
 
@@ -65,14 +69,36 @@ screenshot. `FeedbackEntry.getSentimentKey()` now normalises the label to upper 
 template and the JavaScript both use it, and there is a fallback rule so an unrecognised
 sentiment is grey rather than invisible.
 
-**The model is `gemini-2.5-flash`.** The lab pins `gemini-1.5-flash`, which is no longer served
-to new API keys on the free tier. The model name is a property, so it can be changed without
-touching code.
+**The model is `gemini-3.5-flash-lite`.** The lab pins `gemini-1.5-flash`, which is no longer
+served to new API keys. `gemini-2.5-flash` is refused the same way: it appears in the model
+listing, but calling it returns 404 with *"no longer available to new users"*. The model name
+is a property, so it can be changed without touching code as this keeps moving.
 
-**Rate limit retries.** Fifty sequential calls against a free tier quota measured per minute
-hits HTTP 429. Without handling, those entries silently fall back to "Uncategorized" and the
-dashboard looks like the model had nothing to say. `GeminiService` now retries a 429 with
-exponential backoff, and returns a message naming the reason when it finally gives up.
+**Entries go to Gemini in batches, not one call each.** This is the change that decides whether
+the app works at all on the free tier, and it is worth spelling out.
+
+The lab calls Gemini once per feedback entry, fifty times per dashboard load. Running that
+produced a stream of HTTP 429s. The error body says why:
+
+```
+quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier
+limit: 20, model: gemini-3.6-flash
+```
+
+Twenty requests **per day**, per model, not the "approximately 60 queries per minute" the lab
+promises. One call per entry cannot finish a single page load, ever, on a free key. It burns
+the daily quota at entry twenty and the remaining thirty degrade silently to "Uncategorized",
+which on the dashboard is indistinguishable from the model having nothing useful to say.
+
+Batches of ten mean five calls for the whole file. Measured end to end: fifty entries enhanced
+in 18.9 seconds, no throttling. `enhanceFeedback` is kept as the per-entry fallback for any id
+the model omits from a batch answer, so a malformed response costs a few entries rather than
+all of them.
+
+Two smaller things in the same area. `GeminiService` retries a 429 with exponential backoff
+rather than giving up on the first one. And `thinkingLevel` is set to `low`: Gemini 3.x reasons
+before answering by default, which measured 2.9 s against 1.1 s per call on a task this
+mechanical.
 
 One more thing worth knowing: a 200 response from Gemini does not guarantee text. The
 `candidates` array comes back empty when the prompt is blocked, and a candidate arrives with no
